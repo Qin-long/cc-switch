@@ -151,6 +151,17 @@ fn orchestrator_planner_model(model: &str) -> Option<String> {
         .then(|| format!("gemini-4-{variant}"))
 }
 
+/// Orchestrator 执行轮：原生库只记 `gemini-flash-worker-agy` / `Gemini Flash`，不带版本；
+/// Antigravity 介绍 Orchestrator 时说明执行者是 Gemini 4 Hydrogen，按它计价并记进
+/// `pricing_model`，定价表补上 Hydrogen 后回填即可命中。
+fn orchestrator_worker_model(model: &str) -> Option<String> {
+    matches!(
+        model.to_ascii_lowercase().as_str(),
+        "gemini-flash" | "gemini-flash-worker-agy"
+    )
+    .then(|| "gemini-4-hydrogen".to_string())
+}
+
 /// `Model Selection` 选的是 Orchestrator 时，它只说明会话处于该模式，分不出某一步是规划还是执行。
 fn is_orchestrator(display: &str) -> bool {
     orchestrator_planner_model(&model_id_of(display)).is_some()
@@ -321,7 +332,9 @@ fn import_records_with_cursor(
         let planner = orchestrator_planner_model(&model);
         let resolved =
             planner.is_none() || known_model(row).is_some() || native_steps.contains(&step);
-        let mut pricing_model = planner.filter(|_| resolved);
+        let mut pricing_model = planner
+            .filter(|_| resolved)
+            .or_else(|| orchestrator_worker_model(&model));
         // 原生库暂时不可读时，保留已恢复的模型（及其计价模型）；Token 仍按最新日志更新。
         let (model, display) = if (model == "unknown" || !resolved) && fresh == 0 {
             let stored = tx
@@ -646,6 +659,13 @@ mod tests {
         }
         assert!(is_orchestrator("Orchestrator (Carbon)"));
         assert!(!is_orchestrator("Gemini Flash"));
+        for worker in ["gemini-flash", "gemini-flash-worker-agy"] {
+            assert_eq!(
+                orchestrator_worker_model(worker).as_deref(),
+                Some("gemini-4-hydrogen")
+            );
+        }
+        assert_eq!(orchestrator_worker_model("gemini-3.8-flash"), None);
     }
 
     /// Shape of a real Orchestrator session: one Model Selection, then a planning turn that
@@ -718,11 +738,11 @@ mod tests {
                 )
             );
             assert!(planning.3.parse::<f64>().unwrap() > 0.0, "{}", planning.3);
-            // The execution turn keeps its own model and is not priced as Carbon.
+            // The execution turn keeps its own model and is priced as Hydrogen, not Carbon.
             let execution = orchestrator_row(db, 2);
             assert_eq!(
                 (&*execution.0, &*execution.1, execution.2.as_deref()),
-                ("gemini-flash", "Gemini Flash", None)
+                ("gemini-flash", "Gemini Flash", Some("gemini-4-hydrogen"))
             );
         };
         check(&db);
