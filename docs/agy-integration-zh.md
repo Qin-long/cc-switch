@@ -76,7 +76,13 @@ Token 用量只导入完成的模型响应。实测使用本地模拟 Gemini SSE
 
 用量模型优先取 JSONL 响应中的模型字段或该步骤之前的 `Model Selection` 事件。两者均缺失时（例如子代理会话），从同一 CLI、IDE 或私有目录下的 `conversations/<id>.db` 只读查询：通过 `steps.metadata` 的生成记录编号，读取对应 `gen_metadata` 中的模型名称：优先取带档位的完整 ID（如 `gemini-4-argon-high`，与 `Model Selection` 得到的 ID 一致，计价时剥掉档位；旧版若记的是显示名也按同样规则转换），没有时回退到基础模型名（如 `gemini-3.8-flash-n`）。Protobuf 仅解析关联和模型字段，不通过对话正文或 `flash`、`pro` 档位猜测模型。数据库忙或不可读时继续导入 Token，保留已经恢复的模型名称；后续同步可补全仍保留的 `unknown` 明细。
 
-Orchestrator 模式（`Orchestrator (Carbon)`、`Orchestrator (Argon)`）的原生基础名只有 `gemini-pro-orchestrator`，定价表里没有对应 ID。明细的 `model` 仍记 `orchestrator-carbon` / `orchestrator-argon`，方便区分模式；计价按同名的 Gemini 4 模型（`gemini-4-carbon` / `gemini-4-argon`），并写入 `pricing_model`，当时缺价时补价也能按它回填。只认这两个代号，其它 `orchestrator-*` 不推测底层模型。此前已导入的 Orchestrator 明细会在下次同步时重读一次会话并原地更新费用（被保留策略清理的明细不会重新导入）。
+Orchestrator 模式（`agy models` 中的 `gemini-pro-orchestrator` = `Orchestrator (Carbon)`、`gemini-pro-orchestrator-argon` = `Orchestrator (Argon)`）分规划轮和执行轮：规划轮做只读调查，调用 `exit_plan_mode` 后交给执行模型改文件，执行完再交回规划轮。两者在同一个会话里，`Model Selection` 只出现一次，transcript 也不记逐条模型；只有原生库逐条区分——规划轮记为 Orchestrator 本身，执行轮记为 `gemini-flash-worker-agy` / `Gemini Flash`。因此 `Model Selection` 为 Orchestrator 的步骤一律以原生库的逐条模型为准：
+
+- 规划轮：明细的 `model` 记 `orchestrator-carbon` / `orchestrator-argon`，方便区分模式；按同名的 Gemini 4 模型（`gemini-4-carbon` / `gemini-4-argon`）估算费用，并写入 `pricing_model`，当时缺价时补价也能按它回填。
+- 执行轮：记为 `gemini-flash`（请求模型 `Gemini Flash`）。原生库没有记录它的具体版本，暂不定价。
+- 原生库读不到时，仅凭 `Model Selection` 分不清规划和执行，记为 Orchestrator 但不计价；已经从原生库恢复过的明细保留原有模型。
+
+只认这两个代号，其它 `orchestrator-*` 不推测底层模型。此前已导入的 Orchestrator 明细会在下次同步时重读一次会话并原地更新（被保留策略清理的明细不会重新导入）。
 
 无法确定的模型仍记为 `unknown`。费用沿用现有模型价格表估算，不代表实际账单；查不到价格时为 0；只有基础模型名时，`-n`、`-tiered` 等原生后缀也沿用同一价格匹配规则，不按后缀推定价格。用量导入不从当前供应商反推历史模型，也不更改原生登录、订阅额度或计费。
 

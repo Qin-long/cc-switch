@@ -133,16 +133,27 @@ fn model_id_of(display: &str) -> String {
         .join("-")
 }
 
-/// Orchestrator 模式（显示名 `Orchestrator (Carbon)` / `Orchestrator (Argon)`）由同名的
-/// Gemini 4 模型做编排，原生库的基础名只有 `gemini-pro-orchestrator`，定价表里没有这两个 ID。
-/// `model` 仍记 `orchestrator-carbon`，好在请求日志里区分模式；计价改按对应的 Gemini 4 模型，
-/// 并把它记进 `pricing_model`：当时查不到价也照记，之后补上价格时回填能按它命中。
-/// 只认这两个已知的代号，不从其它 `orchestrator-*` 推测底层模型。
-fn pricing_model_of(model: &str) -> Option<String> {
-    let rest = model.to_ascii_lowercase();
-    let rest = rest.strip_prefix("orchestrator-")?;
-    let variant = rest.split('-').next()?;
-    matches!(variant, "argon" | "carbon").then(|| format!("gemini-4-{rest}"))
+/// Orchestrator 模式（`agy models`：`gemini-pro-orchestrator` = `Orchestrator (Carbon)`，
+/// `gemini-pro-orchestrator-argon` = `Orchestrator (Argon)`）分规划轮和执行轮。原生库逐条记录：
+/// 规划轮记成 Orchestrator 本身，`exit_plan_mode` 之后的执行轮记成执行模型
+/// （`gemini-flash-worker-agy` / `Gemini Flash`）。规划轮由同名的 Gemini 4 模型完成，这里返回
+/// 它的 ID 用于计价并记进 `pricing_model`（当时查不到价也照记，之后补价按它回填）；`model`
+/// 仍记 `orchestrator-carbon`，好在请求日志里区分模式。只认这两个代号，其它名字一律不推测。
+fn orchestrator_planner_model(model: &str) -> Option<String> {
+    let model = model.to_ascii_lowercase();
+    let variant = match model.as_str() {
+        "gemini-pro-orchestrator" => "carbon",
+        id => id
+            .strip_prefix("gemini-pro-orchestrator-")
+            .or_else(|| id.strip_prefix("orchestrator-"))?,
+    };
+    matches!(variant.split('-').next(), Some("argon" | "carbon"))
+        .then(|| format!("gemini-4-{variant}"))
+}
+
+/// `Model Selection` 选的是 Orchestrator 时，它只说明会话处于该模式，分不出某一步是规划还是执行。
+fn is_orchestrator(display: &str) -> bool {
+    orchestrator_planner_model(&model_id_of(display)).is_some()
 }
 
 /// 五个金额（输入、输出、缓存读、缓存写、合计）；查不到价格的记 0。
@@ -225,7 +236,10 @@ fn import_records_with_cursor(
 
     // 子代理通常没有 Model Selection；按步骤关联原生生成记录，不推测档位映射。
     // 耗时和首字也只在原生库里有（transcript 的时间戳只到秒、没有完成时间）。
+    // Orchestrator 会话里，同一个 Model Selection 下既有规划轮也有执行轮，只有原生库逐条记了
+    // 实际模型，所以这些步骤总要查原生库，并以它为准。
     let mut timing_by_step = std::collections::HashMap::new();
+    let mut native_steps = std::collections::HashSet::new();
     let mut native_ok = true;
     if let Some(transcript) = transcript {
         let settled = steps_with_timing(db, session, &ordered)?;
@@ -234,7 +248,10 @@ fn import_records_with_cursor(
             .filter(|row| row["type"] == "PLANNER_RESPONSE" && row["status"] == "DONE")
             .filter_map(|row| {
                 let step = row["step_index"].as_u64()?;
-                let needs_model = known_model(row).is_none() && !model_by_step.contains_key(&step);
+                let needs_model = known_model(row).is_none()
+                    && model_by_step
+                        .get(&step)
+                        .is_none_or(|model| is_orchestrator(model));
                 (needs_model || !settled.contains(&step)).then_some(step)
             })
             .collect();
@@ -243,7 +260,13 @@ fn import_records_with_cursor(
                 Ok(generations) => {
                     for (step, generation) in generations {
                         if let Some(model) = generation.model {
-                            model_by_step.entry(step).or_insert(model);
+                            if model_by_step
+                                .get(&step)
+                                .is_none_or(|selected| is_orchestrator(selected))
+                            {
+                                model_by_step.insert(step, model);
+                                native_steps.insert(step);
+                            }
                         }
                         if let Some(timing) = generation.timing {
                             timing_by_step.insert(step, timing);
@@ -293,21 +316,37 @@ fn import_records_with_cursor(
             .or_else(|| model_by_step.get(&step).cloned())
             .unwrap_or_else(|| "unknown".to_string());
         let model = model_id_of(&display);
-        // 原生库暂时不可读时，保留已恢复的模型；Token 仍按最新日志更新。
-        let (model, display) = if model == "unknown" && fresh == 0 {
-            tx.prepare_cached(
-                "SELECT model, COALESCE(request_model, model) FROM proxy_request_logs
-                  WHERE request_id=?1 AND model!='unknown'",
-            )?
-            .query_row([&id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .optional()?
-            .unwrap_or((model, display))
+        // Orchestrator 只有这一步自己的记录（原生库或响应里的模型字段）能证明是规划轮；
+        // 只靠 Model Selection 时分不清规划和执行，不计价。
+        let planner = orchestrator_planner_model(&model);
+        let resolved =
+            planner.is_none() || known_model(row).is_some() || native_steps.contains(&step);
+        let mut pricing_model = planner.filter(|_| resolved);
+        // 原生库暂时不可读时，保留已恢复的模型（及其计价模型）；Token 仍按最新日志更新。
+        let (model, display) = if (model == "unknown" || !resolved) && fresh == 0 {
+            let stored = tx
+                .prepare_cached(
+                    "SELECT model, COALESCE(request_model, model), pricing_model FROM proxy_request_logs
+                      WHERE request_id=?1 AND model!='unknown'",
+                )?
+                .query_row([&id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .optional()?;
+            match stored {
+                Some((model, display, stored_pricing)) => {
+                    pricing_model = stored_pricing;
+                    (model, display)
+                }
+                None => (model, display),
+            }
         } else {
             (model, display)
         };
-        let pricing_model = pricing_model_of(&model);
         let [input_cost, output_cost, cache_cost, write_cost, total_cost] = costs(
             &tx,
             &mut pricing_cache,
@@ -587,106 +626,127 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_models_price_as_their_gemini_4_model() {
-        assert_eq!(
-            pricing_model_of("orchestrator-carbon").as_deref(),
-            Some("gemini-4-carbon")
-        );
-        assert_eq!(
-            pricing_model_of("orchestrator-Argon").as_deref(),
-            Some("gemini-4-argon")
-        );
-        assert_eq!(
-            pricing_model_of("orchestrator-argon-high").as_deref(),
-            Some("gemini-4-argon-high")
-        );
-        assert_eq!(pricing_model_of("orchestrator-neon"), None);
-        assert_eq!(pricing_model_of("gemini-4-carbon"), None);
-        assert_eq!(pricing_model_of("unknown"), None);
+    fn orchestrator_ids_map_to_their_planning_model() {
+        for (model, planner) in [
+            ("gemini-pro-orchestrator", Some("gemini-4-carbon")),
+            ("gemini-pro-orchestrator-argon", Some("gemini-4-argon")),
+            ("orchestrator-carbon", Some("gemini-4-carbon")),
+            ("orchestrator-Argon", Some("gemini-4-argon")),
+            ("orchestrator-argon-high", Some("gemini-4-argon-high")),
+            ("orchestrator-neon", None),
+            ("gemini-flash-worker-agy", None),
+            ("gemini-4-carbon", None),
+            ("unknown", None),
+        ] {
+            assert_eq!(
+                orchestrator_planner_model(model).as_deref(),
+                planner,
+                "{model}"
+            );
+        }
+        assert!(is_orchestrator("Orchestrator (Carbon)"));
+        assert!(!is_orchestrator("Gemini Flash"));
     }
 
-    #[test]
-    fn orchestrator_usage_keeps_its_model_and_is_priced() {
-        if crate::config::sqlite_unsupported_in_temp_dir() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("conversations")).unwrap();
-        let source = dir
-            .path()
-            .join("brain/orch/.system_generated/logs/transcript_full.jsonl");
-        // Real generations: field 19 is `gemini-pro-orchestrator`, field 21 the display name.
+    /// Shape of a real Orchestrator session: one Model Selection, then a planning turn that
+    /// ends with `exit_plan_mode` and an execution turn, told apart only by the native records.
+    fn write_orchestrator_session(dir: &Path) -> std::path::PathBuf {
+        std::fs::create_dir(dir.join("conversations")).unwrap();
         let native = native_models::write_test_database(
-            &dir.path().join("conversations/orch.db"),
-            &[(2, 0, "gemini-pro-orchestrator")],
+            &dir.join("conversations/orch.db"),
+            &[
+                (1, 0, "gemini-pro-orchestrator"),
+                (2, 1, "gemini-flash-worker-agy"),
+            ],
         );
         native_models::set_test_generation(
             &native,
             0,
             "gemini-pro-orchestrator",
-            &native_models::test_model_id("Orchestrator (Argon)"),
+            &native_models::test_model_id("Orchestrator (Carbon)"),
         );
-        let db = Database::memory().unwrap();
-        let rows = vec![
+        native_models::set_test_generation(
+            &native,
+            1,
+            "gemini-flash-worker-agy",
+            &native_models::test_model_id("Gemini Flash"),
+        );
+        dir.join("brain/orch/.system_generated/logs/transcript_full.jsonl")
+    }
+
+    fn orchestrator_rows() -> Vec<Value> {
+        vec![
             json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"The user changed setting `Model Selection` from Gemini 4 Carbon (High) to Orchestrator (Carbon). No need to comment"}),
             json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","input_tokens":7083,"output_tokens":1021,"cache_read_tokens":46100}),
-            json!({"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","input_tokens":1000}),
-        ];
-        // Step 1 first arrives without its Model Selection; step 2 is named by the native generation.
-        assert_eq!(
-            import_records(&db, "orch", &rows[1..2], None).unwrap(),
-            (1, 0)
-        );
-        assert_eq!(
-            import_records(&db, "orch", &rows[2..], Some(&source)).unwrap(),
-            (1, 0)
-        );
-        let conn = db.conn.lock().unwrap();
-        for (id, model, request_model, pricing_model) in [
-            ("agy:orch:1", "unknown", "unknown", None::<&str>),
-            (
-                "agy:orch:2",
-                "orchestrator-argon",
-                "Orchestrator (Argon)",
-                Some("gemini-4-argon"),
-            ),
-        ] {
-            let got: (String, String, Option<String>) = conn
-                .query_row(
-                    "SELECT model,request_model,pricing_model FROM proxy_request_logs WHERE request_id=?1",
-                    [id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .unwrap();
-            assert_eq!(
-                (&*got.0, &*got.1, got.2.as_deref()),
-                (model, request_model, pricing_model)
-            );
-        }
-        drop(conn);
+            json!({"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","input_tokens":2754,"output_tokens":9668}),
+        ]
+    }
 
-        // Re-importing with the Model Selection prices the row that was unknown before.
-        assert_eq!(
-            import_records(&db, "orch", &rows[..2], None).unwrap(),
-            (1, 0)
-        );
-        let conn = db.conn.lock().unwrap();
-        let got: (String, String, Option<String>, String) = conn
+    fn orchestrator_row(db: &Database, step: u64) -> (String, String, Option<String>, String) {
+        db.conn
+            .lock()
+            .unwrap()
             .query_row(
-                "SELECT model,request_model,pricing_model,total_cost_usd FROM proxy_request_logs WHERE request_id='agy:orch:1'",
-                [],
+                "SELECT model,request_model,pricing_model,total_cost_usd FROM proxy_request_logs WHERE request_id=?1",
+                [format!("agy:orch:{step}")],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
-            .unwrap();
+            .unwrap()
+    }
+
+    #[test]
+    fn orchestrator_sessions_split_planning_and_execution_by_native_generation() {
+        if crate::config::sqlite_unsupported_in_temp_dir() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = write_orchestrator_session(dir.path());
+        let db = Database::memory().unwrap();
+        let rows = orchestrator_rows();
         assert_eq!(
-            (&*got.0, &*got.1, got.2.as_deref()),
-            (
-                "orchestrator-carbon",
-                "Orchestrator (Carbon)",
-                Some("gemini-4-carbon")
-            )
+            import_records(&db, "orch", &rows, Some(&source)).unwrap(),
+            (2, 0)
         );
-        assert!(got.3.parse::<f64>().unwrap() > 0.0, "{}", got.3);
+        let check = |db: &Database| {
+            let planning = orchestrator_row(db, 1);
+            assert_eq!(
+                (&*planning.0, &*planning.1, planning.2.as_deref()),
+                (
+                    "orchestrator-carbon",
+                    "Orchestrator (Carbon)",
+                    Some("gemini-4-carbon")
+                )
+            );
+            assert!(planning.3.parse::<f64>().unwrap() > 0.0, "{}", planning.3);
+            // The execution turn keeps its own model and is not priced as Carbon.
+            let execution = orchestrator_row(db, 2);
+            assert_eq!(
+                (&*execution.0, &*execution.1, execution.2.as_deref()),
+                ("gemini-flash", "Gemini Flash", None)
+            );
+        };
+        check(&db);
+
+        // Without the native database the Model Selection cannot tell the turns apart:
+        // the recovered models are kept rather than relabelled as Orchestrator.
+        assert_eq!(import_records(&db, "orch", &rows, None).unwrap(), (0, 2));
+        check(&db);
+    }
+
+    #[test]
+    fn orchestrator_model_selection_alone_is_not_priced() {
+        let db = Database::memory().unwrap();
+        assert_eq!(
+            import_records(&db, "orch", &orchestrator_rows(), None).unwrap(),
+            (2, 0)
+        );
+        for step in [1, 2] {
+            let got = orchestrator_row(&db, step);
+            assert_eq!(
+                (&*got.0, &*got.1, got.2.as_deref(), &*got.3),
+                ("orchestrator-carbon", "Orchestrator (Carbon)", None, "0")
+            );
+        }
     }
 
     #[test]
