@@ -18,6 +18,11 @@ use std::path::{Path, PathBuf};
 
 mod native_models;
 
+/// Part of each transcript's sync cursor. Bump it when an import rule changes rows that are
+/// already stored (v2: Orchestrator pricing) so every transcript is read once more and the
+/// retained rows are updated in place; deduplication still keeps pruned rows out.
+const AGY_IMPORT_VERSION: &str = "v2";
+
 struct AgySyncCursorUpdate<'a> {
     key: &'a str,
     modified: i64,
@@ -53,7 +58,10 @@ fn sync_agy_usage_from_files(
         };
         let modified = metadata_modified_nanos(&metadata);
         let size = metadata.len() as i64;
-        let native_state = native_models::native_state_fingerprint(&path);
+        let native_state = format!(
+            "{AGY_IMPORT_VERSION}:{}",
+            native_models::native_state_fingerprint(&path)
+        );
         if cursor.is_some_and(|c| {
             c.last_modified == modified
                 && c.last_byte_offset == Some(size)
@@ -123,6 +131,18 @@ fn model_id_of(display: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join("-")
+}
+
+/// Orchestrator 模式（显示名 `Orchestrator (Carbon)` / `Orchestrator (Argon)`）由同名的
+/// Gemini 4 模型做编排，原生库的基础名只有 `gemini-pro-orchestrator`，定价表里没有这两个 ID。
+/// `model` 仍记 `orchestrator-carbon`，好在请求日志里区分模式；计价改按对应的 Gemini 4 模型，
+/// 并把它记进 `pricing_model`：当时查不到价也照记，之后补上价格时回填能按它命中。
+/// 只认这两个已知的代号，不从其它 `orchestrator-*` 推测底层模型。
+fn pricing_model_of(model: &str) -> Option<String> {
+    let rest = model.to_ascii_lowercase();
+    let rest = rest.strip_prefix("orchestrator-")?;
+    let variant = rest.split('-').next()?;
+    matches!(variant, "argon" | "carbon").then(|| format!("gemini-4-{rest}"))
 }
 
 /// 五个金额（输入、输出、缓存读、缓存写、合计）；查不到价格的记 0。
@@ -287,10 +307,11 @@ fn import_records_with_cursor(
         } else {
             (model, display)
         };
+        let pricing_model = pricing_model_of(&model);
         let [input_cost, output_cost, cache_cost, write_cost, total_cost] = costs(
             &tx,
             &mut pricing_cache,
-            &model,
+            pricing_model.as_deref().unwrap_or(&model),
             [input, output, cache, write],
         );
         // 原生库记的是精确值；读不到时耗时记 0、首字记 NULL，和其它会话日志一样表示「没有计时」。
@@ -302,8 +323,8 @@ fn import_records_with_cursor(
             // If retention already removed it, its tombstone still forbids resurrection.
             // Timing is only ever filled in: an unreadable native database keeps what was stored.
             let changed = tx
-                .prepare_cached("UPDATE proxy_request_logs SET model=?2,request_model=?7,input_tokens=?3,output_tokens=?4,cache_read_tokens=?5,cache_creation_tokens=?6,input_cost_usd=?8,output_cost_usd=?9,cache_read_cost_usd=?10,cache_creation_cost_usd=?11,total_cost_usd=?12,latency_ms=CASE WHEN ?13>0 THEN ?13 ELSE latency_ms END,first_token_ms=COALESCE(?14,first_token_ms) WHERE request_id=?1 AND (model!=?2 OR request_model!=?7 OR input_tokens!=?3 OR output_tokens!=?4 OR cache_read_tokens!=?5 OR cache_creation_tokens!=?6 OR total_cost_usd!=?12 OR (?13>0 AND latency_ms!=?13) OR (?14 IS NOT NULL AND first_token_ms IS NOT ?14))")?
-                .execute(params![id,model,input,output,cache,write,display,input_cost,output_cost,cache_cost,write_cost,total_cost,latency_ms,first_token_ms])?;
+                .prepare_cached("UPDATE proxy_request_logs SET model=?2,request_model=?7,pricing_model=?15,input_tokens=?3,output_tokens=?4,cache_read_tokens=?5,cache_creation_tokens=?6,input_cost_usd=?8,output_cost_usd=?9,cache_read_cost_usd=?10,cache_creation_cost_usd=?11,total_cost_usd=?12,latency_ms=CASE WHEN ?13>0 THEN ?13 ELSE latency_ms END,first_token_ms=COALESCE(?14,first_token_ms) WHERE request_id=?1 AND (model!=?2 OR request_model!=?7 OR pricing_model IS NOT ?15 OR input_tokens!=?3 OR output_tokens!=?4 OR cache_read_tokens!=?5 OR cache_creation_tokens!=?6 OR total_cost_usd!=?12 OR (?13>0 AND latency_ms!=?13) OR (?14 IS NOT NULL AND first_token_ms IS NOT ?14))")?
+                .execute(params![id,model,input,output,cache,write,display,input_cost,output_cost,cache_cost,write_cost,total_cost,latency_ms,first_token_ms,pricing_model])?;
             imported += changed as u32;
             skipped += u32::from(changed == 0);
             continue;
@@ -312,12 +333,12 @@ fn import_records_with_cursor(
         // thinking. Never subtract cache or add thinking a second time. Missing historical
         // models remain unknown and unpriced; never fall back to the active provider.
         tx.prepare_cached("INSERT INTO proxy_request_logs (
-            request_id,provider_id,app_type,model,request_model,input_tokens,output_tokens,
+            request_id,provider_id,app_type,model,request_model,pricing_model,input_tokens,output_tokens,
             cache_read_tokens,cache_creation_tokens,input_cost_usd,output_cost_usd,
             cache_read_cost_usd,cache_creation_cost_usd,total_cost_usd,latency_ms,first_token_ms,status_code,
             session_id,provider_type,is_streaming,cost_multiplier,created_at,data_source,input_token_semantics
-        ) VALUES (?1,'_agy_session','agy',?2,?10,?3,?4,?5,?6,?11,?12,?13,?14,?15,?16,?17,200,?7,'agy_session',1,'1',?8,'agy_session',?9)")?
-        .execute(params![id, model, input, output, cache, write, session, agy::timestamp(row).unwrap_or(0)/1000, INPUT_TOKEN_SEMANTICS_FRESH, display, input_cost, output_cost, cache_cost, write_cost, total_cost, latency_ms, first_token_ms])?;
+        ) VALUES (?1,'_agy_session','agy',?2,?10,?18,?3,?4,?5,?6,?11,?12,?13,?14,?15,?16,?17,200,?7,'agy_session',1,'1',?8,'agy_session',?9)")?
+        .execute(params![id, model, input, output, cache, write, session, agy::timestamp(row).unwrap_or(0)/1000, INPUT_TOKEN_SEMANTICS_FRESH, display, input_cost, output_cost, cache_cost, write_cost, total_cost, latency_ms, first_token_ms, pricing_model])?;
         imported += 1;
     }
     if let Some(cursor) = sync_cursor {
@@ -563,6 +584,138 @@ mod tests {
             assert_eq!((&*got.0, &*got.1), ("gemini-4-argon-medium", request_model));
             assert!(got.2.parse::<f64>().unwrap() > 0.0);
         }
+    }
+
+    #[test]
+    fn orchestrator_models_price_as_their_gemini_4_model() {
+        assert_eq!(
+            pricing_model_of("orchestrator-carbon").as_deref(),
+            Some("gemini-4-carbon")
+        );
+        assert_eq!(
+            pricing_model_of("orchestrator-Argon").as_deref(),
+            Some("gemini-4-argon")
+        );
+        assert_eq!(
+            pricing_model_of("orchestrator-argon-high").as_deref(),
+            Some("gemini-4-argon-high")
+        );
+        assert_eq!(pricing_model_of("orchestrator-neon"), None);
+        assert_eq!(pricing_model_of("gemini-4-carbon"), None);
+        assert_eq!(pricing_model_of("unknown"), None);
+    }
+
+    #[test]
+    fn orchestrator_usage_keeps_its_model_and_is_priced() {
+        if crate::config::sqlite_unsupported_in_temp_dir() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("conversations")).unwrap();
+        let source = dir
+            .path()
+            .join("brain/orch/.system_generated/logs/transcript_full.jsonl");
+        // Real generations: field 19 is `gemini-pro-orchestrator`, field 21 the display name.
+        let native = native_models::write_test_database(
+            &dir.path().join("conversations/orch.db"),
+            &[(2, 0, "gemini-pro-orchestrator")],
+        );
+        native_models::set_test_generation(
+            &native,
+            0,
+            "gemini-pro-orchestrator",
+            &native_models::test_model_id("Orchestrator (Argon)"),
+        );
+        let db = Database::memory().unwrap();
+        let rows = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"The user changed setting `Model Selection` from Gemini 4 Carbon (High) to Orchestrator (Carbon). No need to comment"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","input_tokens":7083,"output_tokens":1021,"cache_read_tokens":46100}),
+            json!({"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","input_tokens":1000}),
+        ];
+        // Step 1 first arrives without its Model Selection; step 2 is named by the native generation.
+        assert_eq!(
+            import_records(&db, "orch", &rows[1..2], None).unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            import_records(&db, "orch", &rows[2..], Some(&source)).unwrap(),
+            (1, 0)
+        );
+        let conn = db.conn.lock().unwrap();
+        for (id, model, request_model, pricing_model) in [
+            ("agy:orch:1", "unknown", "unknown", None::<&str>),
+            (
+                "agy:orch:2",
+                "orchestrator-argon",
+                "Orchestrator (Argon)",
+                Some("gemini-4-argon"),
+            ),
+        ] {
+            let got: (String, String, Option<String>) = conn
+                .query_row(
+                    "SELECT model,request_model,pricing_model FROM proxy_request_logs WHERE request_id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (&*got.0, &*got.1, got.2.as_deref()),
+                (model, request_model, pricing_model)
+            );
+        }
+        drop(conn);
+
+        // Re-importing with the Model Selection prices the row that was unknown before.
+        assert_eq!(
+            import_records(&db, "orch", &rows[..2], None).unwrap(),
+            (1, 0)
+        );
+        let conn = db.conn.lock().unwrap();
+        let got: (String, String, Option<String>, String) = conn
+            .query_row(
+                "SELECT model,request_model,pricing_model,total_cost_usd FROM proxy_request_logs WHERE request_id='agy:orch:1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (&*got.0, &*got.1, got.2.as_deref()),
+            (
+                "orchestrator-carbon",
+                "Orchestrator (Carbon)",
+                Some("gemini-4-carbon")
+            )
+        );
+        assert!(got.3.parse::<f64>().unwrap() > 0.0, "{}", got.3);
+    }
+
+    #[test]
+    fn orchestrator_rows_imported_before_the_fix_are_repriced_in_place() {
+        let db = Database::memory().unwrap();
+        let rows = vec![
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","model":"Orchestrator (Carbon)","input_tokens":1000,"output_tokens":100}),
+        ];
+        assert_eq!(import_records(&db, "old", &rows, None).unwrap(), (1, 0));
+        // What an earlier build stored: no pricing model, no cost.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE proxy_request_logs SET pricing_model=NULL,input_cost_usd='0',output_cost_usd='0',total_cost_usd='0'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(import_records(&db, "old", &rows, None).unwrap(), (1, 0));
+        let conn = db.conn.lock().unwrap();
+        let got: (Option<String>, String) = conn
+            .query_row(
+                "SELECT pricing_model,total_cost_usd FROM proxy_request_logs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(got.0.as_deref(), Some("gemini-4-carbon"));
+        assert!(got.1.parse::<f64>().unwrap() > 0.0, "{}", got.1);
     }
 
     #[test]
