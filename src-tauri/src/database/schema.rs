@@ -2255,6 +2255,20 @@ impl Database {
                 "0.10",
                 "0",
             ),
+            // Gemini 4 Hydrogen（2026-11-12 核对官方价页 + models.dev）：录标准档 1.50/7.50/0.075/0
+            // （仅支持隐式缓存）。官方价页未列介绍价，全上下文窗口统一定价，无到期日；
+            // Antigravity Orchestrator 模式的执行轮（gemini-flash-worker-agy）按此行计价。
+            // 免费层级可用；批量 / Flex 档（0.75/3.75）、Priority 档不入表，仓库现有口径仅录标准档。
+            // 来源：https://ai.google.dev/gemini-api/docs/pricing#gemini-4-hydrogen
+            // （现 301 跳转至 aistudio.google.com/docs/pricing）
+            (
+                "gemini-4-hydrogen",
+                "Gemini 4 Hydrogen",
+                "1.50",
+                "7.50",
+                "0.075",
+                "0",
+            ),
             // Gemini 3.8 系列（2026-09-02 发布，1M 窗口）
             // 介绍价 0.75/3.75/0.075 至 2026-12-31，2027-01-01 起挂牌价 1.50/7.50/0.15；口径同 3.7 Flash，勿加豁免。
             (
